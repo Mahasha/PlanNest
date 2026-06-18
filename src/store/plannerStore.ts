@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { appConfig } from '../config/app'
 import { demoData } from '../data/demo'
+import * as sync from '../lib/plannerSync'
 import type {
   BoardColumn,
   Filters,
@@ -41,6 +42,8 @@ type NewTaskInput = {
 type PlannerState = PlannerData & {
   filters: Filters
   navOpen: boolean
+  synced: boolean
+  hydrate: (data: PlannerData) => void
   setNavOpen: (open: boolean) => void
   setFilter: <K extends keyof Filters>(key: K, value: Filters[K]) => void
   addTask: (input: NewTaskInput) => void
@@ -84,7 +87,7 @@ const defaultFilters: Filters = {
   query: '',
 }
 
-const uid = (prefix: string) => `${prefix}-${crypto.randomUUID()}`
+const uid = () => crypto.randomUUID()
 
 const defaultColumnNames = (type: ProjectType) =>
   type === 'study_plan' ? ['To Do', 'Practice', 'Checked'] : ['To Do', 'In Progress', 'Done']
@@ -106,347 +109,411 @@ const normalizePositions = (tasks: Task[]) => {
 
 export const usePlannerStore = create<PlannerState>()(
   persist(
-    (set) => ({
-      ...demoData,
-      filters: defaultFilters,
-      navOpen: false,
-      setNavOpen: (open) => set({ navOpen: open }),
-      setFilter: (key, value) =>
-        set((state) => ({
-          filters: {
-            ...state.filters,
-            [key]: value,
-            ...(key === 'workspaceId' ? { projectId: 'all', boardView: 'all' } : {}),
-            ...(key === 'projectId' ? { boardView: 'all' } : {}),
-          },
-        })),
-      addTask: (input) =>
-        set((state) => {
-          const project = state.projects.find((item) => item.id === input.projectId)
-          const targetColumn = input.columnId
-            ? state.columns.find((column) => column.id === input.columnId && column.projectId === input.projectId && !column.archived)
-            : undefined
-          const firstColumn = targetColumn ?? state.columns
-            .filter((column) => column.projectId === input.projectId && !column.archived)
-            .sort((a, b) => a.position - b.position)[0]
-          if (!project || !firstColumn) return state
+    (set, get) => {
+      const projectTasks = (projectId: string) => get().tasks.filter((task) => task.projectId === projectId)
+      const findTask = (id: string) => get().tasks.find((task) => task.id === id)
 
-          const isStudy = project.type === 'study_plan' && input.learnerId && input.subjectId
-          const task: Task = {
-            id: uid('task'),
-            title: input.title,
-            description: input.description,
-            workspaceId: input.workspaceId,
-            projectId: input.projectId,
-            columnId: firstColumn.id,
-            priority: input.priority,
-            dueDate: input.dueDate || null,
-            tags: input.tags ?? [],
-            assigneeId: input.assigneeId ?? null,
-            assigneeRoleId: input.assigneeRoleId ?? null,
-            checklist: (input.checklistTitles ?? []).map((title, position) => ({
-              id: uid('check'),
-              taskId: 'pending',
-              title,
-              completed: false,
-              position,
-            })),
-            position: state.tasks.filter((item) => item.columnId === firstColumn.id).length,
-            createdBy: state.profile.id,
-            study: isStudy
-              ? {
-                  learnerId: input.learnerId!,
-                  subjectId: input.subjectId!,
-                  topic: input.topic || 'Study session',
-                  exerciseType: input.exerciseType || 'Practice',
-                  estimatedMinutes: input.estimatedMinutes || 30,
-                  correctionRequired: Boolean(input.correctionRequired),
-                  guardianNotes: input.guardianNotes || undefined,
-                }
-              : null,
-          }
-          task.checklist = task.checklist.map((item) => ({ ...item, taskId: task.id }))
-          return { tasks: [...state.tasks, task] }
-        }),
-      updateTask: (id, patch) =>
-        set((state) => ({
-          tasks: state.tasks.map((task) => (task.id === id ? { ...task, ...patch } : task)),
-        })),
-      deleteTask: (id) =>
-        set((state) => ({
-          tasks: normalizePositions(state.tasks.filter((task) => task.id !== id)),
-        })),
-      completeTask: (id) =>
-        set((state) => {
-          const task = state.tasks.find((item) => item.id === id)
-          if (!task) return state
-          const doneColumn = state.columns.find((column) => column.projectId === task.projectId && column.isCompleted)
-          const firstOpenColumn = state.columns
-            .filter((column) => column.projectId === task.projectId && !column.archived && !column.isCompleted)
-            .sort((a, b) => a.position - b.position)[0]
-          return {
-            tasks: normalizePositions(
-              state.tasks.map((item) =>
-                item.id === id
-                  ? {
-                      ...item,
-                      columnId: item.completedAt ? firstOpenColumn?.id ?? item.columnId : doneColumn?.id ?? item.columnId,
-                      completedAt: item.completedAt ? null : new Date().toISOString(),
-                    }
-                  : item,
-              ),
-            ),
-          }
-        }),
-      moveTask: (taskId, targetColumnId, overTaskId) =>
-        set((state) => {
-          const moving = state.tasks.find((task) => task.id === taskId)
-          if (!moving) return state
-          const targetColumn = state.columns.find((column) => column.id === targetColumnId)
-          if (!targetColumn) return state
-
-          const remaining = state.tasks.filter((task) => task.id !== taskId)
-          const targetTasks = remaining
-            .filter((task) => task.columnId === targetColumnId)
-            .sort((a, b) => a.position - b.position)
-          const overIndex = overTaskId ? targetTasks.findIndex((task) => task.id === overTaskId) : -1
-          const insertIndex = overIndex >= 0 ? overIndex : targetTasks.length
-          targetTasks.splice(insertIndex, 0, {
-            ...moving,
-            columnId: targetColumnId,
-            completedAt: targetColumn.isCompleted ? moving.completedAt ?? new Date().toISOString() : null,
-          })
-
-          const rebuilt = [
-            ...remaining.filter((task) => task.columnId !== targetColumnId),
-            ...targetTasks.map((task, index) => ({ ...task, position: index })),
-          ]
-          return { tasks: normalizePositions(rebuilt) }
-        }),
-      addColumn: (projectId, name, isCompleted = false) =>
-        set((state) => {
-          const position = state.columns.filter((column) => column.projectId === projectId).length
-          const column: BoardColumn = {
-            id: uid('column'),
-            projectId,
-            name,
-            position,
-            isCompleted,
-          }
-          return {
-            columns: [
-              ...state.columns.map((item) => (isCompleted && item.projectId === projectId ? { ...item, isCompleted: false } : item)),
-              column,
-            ],
-          }
-        }),
-      renameColumn: (columnId, name) =>
-        set((state) => ({
-          columns: state.columns.map((column) => (column.id === columnId ? { ...column, name } : column)),
-        })),
-      archiveColumn: (columnId, moveTaskColumnId) =>
-        set((state) => {
-          const column = state.columns.find((item) => item.id === columnId)
-          if (!column) return state
-          const fallbackColumn = moveTaskColumnId
-            ? state.columns.find((item) => item.id === moveTaskColumnId && item.projectId === column.projectId && !item.archived)
-            : undefined
-          return {
-            columns: state.columns.map((item) => (item.id === columnId ? { ...item, archived: true, isCompleted: false } : item)),
-            tasks: fallbackColumn
-              ? normalizePositions(
-                  state.tasks.map((task) =>
-                    task.columnId === columnId
-                      ? {
-                          ...task,
-                          columnId: fallbackColumn.id,
-                          completedAt: fallbackColumn.isCompleted ? task.completedAt ?? new Date().toISOString() : null,
-                        }
-                      : task,
-                  ),
-                )
-              : state.tasks.filter((task) => task.columnId !== columnId),
-          }
-        }),
-      setCompletedColumn: (projectId, columnId) =>
-        set((state) => ({
-          columns: state.columns.map((column) =>
-            column.projectId === projectId ? { ...column, isCompleted: column.id === columnId } : column,
-          ),
-        })),
-      reorderColumn: (columnId, direction) =>
-        set((state) => {
-          const column = state.columns.find((item) => item.id === columnId)
-          if (!column) return state
-          const projectColumns = state.columns
-            .filter((item) => item.projectId === column.projectId && !item.archived)
-            .sort((a, b) => a.position - b.position)
-          const index = projectColumns.findIndex((item) => item.id === columnId)
-          const target = index + direction
-          if (target < 0 || target >= projectColumns.length) return state
-          const ordered = [...projectColumns]
-          const [removed] = ordered.splice(index, 1)
-          ordered.splice(target, 0, removed)
-          const positions = new Map(ordered.map((item, position) => [item.id, position]))
-          return {
-            columns: state.columns.map((item) => ({
-              ...item,
-              position: positions.get(item.id) ?? item.position,
-            })),
-          }
-        }),
-      addWorkspace: (input) =>
-        set((state) => {
-          const workspaceId = uid('workspace')
-          const workspace = {
-            id: workspaceId,
-            name: input.name,
-            icon: input.icon || input.name.slice(0, 1).toUpperCase(),
-            color: input.color || '#4cc9f0',
-            ownerId: state.profile.id,
-            members: [{ userId: state.profile.id, displayName: state.profile.displayName, role: 'owner' as const }],
-          }
-          // TODO(Supabase): route workspace writes through a persistence service when app-data sync is enabled.
-          return {
-            workspaces: [...state.workspaces, workspace],
-            filters: { ...state.filters, workspaceId, projectId: 'all', boardView: 'all' },
-          }
-        }),
-      updateWorkspace: (id, patch) =>
-        set((state) => ({
-          workspaces: state.workspaces.map((workspace) => (workspace.id === id ? { ...workspace, ...patch } : workspace)),
-        })),
-      archiveWorkspace: (id) =>
-        set((state) => {
-          const projectIds = state.projects.filter((project) => project.workspaceId === id).map((project) => project.id)
-          const nextWorkspaceId = state.workspaces.find((workspace) => workspace.id !== id && !workspace.archived)?.id ?? 'all'
-          return {
-            workspaces: state.workspaces.map((workspace) => (workspace.id === id ? { ...workspace, archived: true } : workspace)),
-            projects: state.projects.map((project) => (project.workspaceId === id ? { ...project, archived: true } : project)),
+      return {
+        ...demoData,
+        filters: defaultFilters,
+        navOpen: false,
+        synced: false,
+        hydrate: (data) =>
+          set({
+            ...data,
+            synced: true,
+            filters: {
+              ...defaultFilters,
+              projectId: data.projects.find((project) => !project.archived)?.id ?? 'all',
+            },
+          }),
+        setNavOpen: (open) => set({ navOpen: open }),
+        setFilter: (key, value) =>
+          set((state) => ({
             filters: {
               ...state.filters,
-              workspaceId: state.filters.workspaceId === id ? nextWorkspaceId : state.filters.workspaceId,
-              projectId: projectIds.includes(state.filters.projectId) ? 'all' : state.filters.projectId,
-              boardView: 'all',
+              [key]: value,
+              ...(key === 'workspaceId' ? { projectId: 'all', boardView: 'all' } : {}),
+              ...(key === 'projectId' ? { boardView: 'all' } : {}),
             },
-          }
-        }),
-      addProject: (input) =>
-        set((state) => {
-          const projectId = uid('project')
-          const project: Project = {
-            id: projectId,
-            workspaceId: input.workspaceId,
-            name: input.name,
-            type: input.type,
-            color: input.color || (input.type === 'study_plan' ? '#27c98b' : '#4cc9f0'),
-          }
-          const columns: BoardColumn[] = defaultColumnNames(input.type).map((columnName, position) => ({
-            id: uid('column'),
-            projectId: project.id,
-            name: columnName,
-            position,
-            isCompleted: position === 2,
+          })),
+        addTask: (input) => {
+          let created: Task | undefined
+          set((state) => {
+            const project = state.projects.find((item) => item.id === input.projectId)
+            const targetColumn = input.columnId
+              ? state.columns.find((column) => column.id === input.columnId && column.projectId === input.projectId && !column.archived)
+              : undefined
+            const firstColumn = targetColumn ?? state.columns
+              .filter((column) => column.projectId === input.projectId && !column.archived)
+              .sort((a, b) => a.position - b.position)[0]
+            if (!project || !firstColumn) return state
+
+            const isStudy = project.type === 'study_plan' && input.learnerId && input.subjectId
+            const task: Task = {
+              id: uid(),
+              title: input.title,
+              description: input.description,
+              workspaceId: input.workspaceId,
+              projectId: input.projectId,
+              columnId: firstColumn.id,
+              priority: input.priority,
+              dueDate: input.dueDate || null,
+              tags: input.tags ?? [],
+              assigneeId: input.assigneeId ?? null,
+              assigneeRoleId: input.assigneeRoleId ?? null,
+              checklist: (input.checklistTitles ?? []).map((title, position) => ({
+                id: uid(),
+                taskId: 'pending',
+                title,
+                completed: false,
+                position,
+              })),
+              position: state.tasks.filter((item) => item.columnId === firstColumn.id).length,
+              createdBy: state.profile.id,
+              study: isStudy
+                ? {
+                    learnerId: input.learnerId!,
+                    subjectId: input.subjectId!,
+                    topic: input.topic || 'Study session',
+                    exerciseType: input.exerciseType || 'Practice',
+                    estimatedMinutes: input.estimatedMinutes || 30,
+                    correctionRequired: Boolean(input.correctionRequired),
+                    guardianNotes: input.guardianNotes || undefined,
+                  }
+                : null,
+            }
+            task.checklist = task.checklist.map((item) => ({ ...item, taskId: task.id }))
+            created = task
+            return { tasks: [...state.tasks, task] }
+          })
+          if (get().synced && created) void sync.upsertTaskRemote(created, get().profile.id)
+        },
+        updateTask: (id, patch) => {
+          set((state) => ({
+            tasks: state.tasks.map((task) => (task.id === id ? { ...task, ...patch } : task)),
           }))
-          return {
-            projects: [...state.projects, project],
-            columns: [...state.columns, ...columns],
-            filters: { ...state.filters, workspaceId: input.workspaceId, projectId, boardView: 'all' },
+          const updated = findTask(id)
+          if (get().synced && updated) void sync.upsertTaskRemote(updated, get().profile.id)
+        },
+        deleteTask: (id) => {
+          const removed = findTask(id)
+          set((state) => ({
+            tasks: normalizePositions(state.tasks.filter((task) => task.id !== id)),
+          }))
+          if (get().synced && removed) {
+            sync.deleteTaskRemote(id)
+            sync.syncTasksRemote(get().tasks.filter((task) => task.columnId === removed.columnId))
           }
-        }),
-      updateProject: (id, patch) =>
-        set((state) => ({
-          projects: state.projects.map((project) => (project.id === id ? { ...project, ...patch } : project)),
-        })),
-      archiveProject: (id) =>
-        set((state) => ({
-          projects: state.projects.map((project) => (project.id === id ? { ...project, archived: true } : project)),
-          filters: {
-            ...state.filters,
-            projectId: state.filters.projectId === id ? 'all' : state.filters.projectId,
-            boardView: state.filters.projectId === id ? 'all' : state.filters.boardView,
-          },
-        })),
-      addWorkspaceMember: (workspaceId, input) =>
-        set((state) => {
-          const member: WorkspaceMember = {
-            userId: uid('user'),
-            displayName: input.displayName,
-            email: input.email,
-            role: input.role,
-            active: true,
+        },
+        completeTask: (id) => {
+          const before = findTask(id)
+          set((state) => {
+            const task = state.tasks.find((item) => item.id === id)
+            if (!task) return state
+            const doneColumn = state.columns.find((column) => column.projectId === task.projectId && column.isCompleted)
+            const firstOpenColumn = state.columns
+              .filter((column) => column.projectId === task.projectId && !column.archived && !column.isCompleted)
+              .sort((a, b) => a.position - b.position)[0]
+            return {
+              tasks: normalizePositions(
+                state.tasks.map((item) =>
+                  item.id === id
+                    ? {
+                        ...item,
+                        columnId: item.completedAt ? firstOpenColumn?.id ?? item.columnId : doneColumn?.id ?? item.columnId,
+                        completedAt: item.completedAt ? null : new Date().toISOString(),
+                      }
+                    : item,
+                ),
+              ),
+            }
+          })
+          if (get().synced && before) sync.syncTasksRemote(projectTasks(before.projectId))
+        },
+        moveTask: (taskId, targetColumnId, overTaskId) => {
+          const before = findTask(taskId)
+          set((state) => {
+            const moving = state.tasks.find((task) => task.id === taskId)
+            if (!moving) return state
+            const targetColumn = state.columns.find((column) => column.id === targetColumnId)
+            if (!targetColumn) return state
+
+            const remaining = state.tasks.filter((task) => task.id !== taskId)
+            const targetTasks = remaining
+              .filter((task) => task.columnId === targetColumnId)
+              .sort((a, b) => a.position - b.position)
+            const overIndex = overTaskId ? targetTasks.findIndex((task) => task.id === overTaskId) : -1
+            const insertIndex = overIndex >= 0 ? overIndex : targetTasks.length
+            targetTasks.splice(insertIndex, 0, {
+              ...moving,
+              columnId: targetColumnId,
+              completedAt: targetColumn.isCompleted ? moving.completedAt ?? new Date().toISOString() : null,
+            })
+
+            const rebuilt = [
+              ...remaining.filter((task) => task.columnId !== targetColumnId),
+              ...targetTasks.map((task, index) => ({ ...task, position: index })),
+            ]
+            return { tasks: normalizePositions(rebuilt) }
+          })
+          if (get().synced && before) sync.syncTasksRemote(projectTasks(before.projectId))
+        },
+        addColumn: (projectId, name, isCompleted = false) => {
+          let created: BoardColumn | undefined
+          set((state) => {
+            const position = state.columns.filter((column) => column.projectId === projectId).length
+            const column: BoardColumn = { id: uid(), projectId, name, position, isCompleted }
+            created = column
+            return {
+              columns: [
+                ...state.columns.map((item) => (isCompleted && item.projectId === projectId ? { ...item, isCompleted: false } : item)),
+                column,
+              ],
+            }
+          })
+          if (get().synced && created) {
+            sync.insertColumnRemote(created)
+            if (isCompleted) sync.syncColumnsRemote(get().columns.filter((column) => column.projectId === projectId))
           }
-          return {
-            workspaces: state.workspaces.map((workspace) =>
-              workspace.id === workspaceId ? { ...workspace, members: [...workspace.members, member] } : workspace,
+        },
+        renameColumn: (columnId, name) => {
+          set((state) => ({
+            columns: state.columns.map((column) => (column.id === columnId ? { ...column, name } : column)),
+          }))
+          if (get().synced) sync.updateColumnRemote(columnId, { name })
+        },
+        archiveColumn: (columnId, moveTaskColumnId) => {
+          const removedTaskIds = !moveTaskColumnId ? get().tasks.filter((task) => task.columnId === columnId).map((task) => task.id) : []
+          const fallbackId = moveTaskColumnId
+          set((state) => {
+            const column = state.columns.find((item) => item.id === columnId)
+            if (!column) return state
+            const fallbackColumn = moveTaskColumnId
+              ? state.columns.find((item) => item.id === moveTaskColumnId && item.projectId === column.projectId && !item.archived)
+              : undefined
+            return {
+              columns: state.columns.map((item) => (item.id === columnId ? { ...item, archived: true, isCompleted: false } : item)),
+              tasks: fallbackColumn
+                ? normalizePositions(
+                    state.tasks.map((task) =>
+                      task.columnId === columnId
+                        ? {
+                            ...task,
+                            columnId: fallbackColumn.id,
+                            completedAt: fallbackColumn.isCompleted ? task.completedAt ?? new Date().toISOString() : null,
+                          }
+                        : task,
+                    ),
+                  )
+                : state.tasks.filter((task) => task.columnId !== columnId),
+            }
+          })
+          if (get().synced) {
+            sync.archiveColumnRemote(columnId)
+            if (fallbackId) sync.syncTasksRemote(get().tasks.filter((task) => task.columnId === fallbackId))
+            else removedTaskIds.forEach((id) => sync.deleteTaskRemote(id))
+          }
+        },
+        setCompletedColumn: (projectId, columnId) => {
+          set((state) => ({
+            columns: state.columns.map((column) =>
+              column.projectId === projectId ? { ...column, isCompleted: column.id === columnId } : column,
             ),
-          }
-        }),
-      updateWorkspaceMember: (workspaceId, userId, patch) =>
-        set((state) => ({
-          workspaces: state.workspaces.map((workspace) =>
-            workspace.id === workspaceId
-              ? {
-                  ...workspace,
-                  members: workspace.members.map((member) => (member.userId === userId ? { ...member, ...patch } : member)),
-                }
-              : workspace,
-          ),
-        })),
-      archiveWorkspaceMember: (workspaceId, userId) =>
-        set((state) => ({
-          workspaces: state.workspaces.map((workspace) =>
-            workspace.id === workspaceId
-              ? {
-                  ...workspace,
-                  members: workspace.members.map((member) => (member.userId === userId ? { ...member, active: false } : member)),
-                }
-              : workspace,
-          ),
-          tasks: state.tasks.map((task) => (task.workspaceId === workspaceId && task.assigneeId === userId ? { ...task, assigneeId: null } : task)),
-        })),
-      addRoleCategory: (workspaceId, input) =>
-        set((state) => ({
-          roleCategories: [...state.roleCategories, { id: uid('role'), workspaceId, name: input.name, color: input.color || '#4cc9f0' }],
-        })),
-      updateRoleCategory: (id, patch) =>
-        set((state) => ({
-          roleCategories: state.roleCategories.map((role) => (role.id === id ? { ...role, ...patch } : role)),
-        })),
-      deleteRoleCategory: (id) =>
-        set((state) => ({
-          roleCategories: state.roleCategories.filter((role) => role.id !== id),
-          tasks: state.tasks.map((task) => (task.assigneeRoleId === id ? { ...task, assigneeRoleId: null } : task)),
-          filters: { ...state.filters, boardView: state.filters.boardView === `role:${id}` ? 'all' : state.filters.boardView },
-        })),
-      addLearner: (workspaceId, name, grade, guardianName) =>
-        set((state) => {
-          const learner: Learner = {
-            id: uid('learner'),
-            workspaceId,
-            name,
-            grade: grade || undefined,
-            guardianName: guardianName || undefined,
-          }
-          return { learners: [...state.learners, learner] }
-        }),
-      addSubject: (workspaceId, name, color = '#27c98b') =>
-        set((state) => {
-          const subject: Subject = {
-            id: uid('subject'),
-            workspaceId,
-            name,
-            color,
-          }
-          return { subjects: [...state.subjects, subject] }
-        }),
-      resetDemo: () => set({ ...demoData, filters: defaultFilters }),
-    }),
+          }))
+          if (get().synced) sync.syncColumnsRemote(get().columns.filter((column) => column.projectId === projectId))
+        },
+        reorderColumn: (columnId, direction) => {
+          set((state) => {
+            const column = state.columns.find((item) => item.id === columnId)
+            if (!column) return state
+            const projectColumns = state.columns
+              .filter((item) => item.projectId === column.projectId && !item.archived)
+              .sort((a, b) => a.position - b.position)
+            const index = projectColumns.findIndex((item) => item.id === columnId)
+            const target = index + direction
+            if (target < 0 || target >= projectColumns.length) return state
+            const ordered = [...projectColumns]
+            const [removed] = ordered.splice(index, 1)
+            ordered.splice(target, 0, removed)
+            const positions = new Map(ordered.map((item, position) => [item.id, position]))
+            return {
+              columns: state.columns.map((item) => ({
+                ...item,
+                position: positions.get(item.id) ?? item.position,
+              })),
+            }
+          })
+          const column = get().columns.find((item) => item.id === columnId)
+          if (get().synced && column) sync.syncColumnsRemote(get().columns.filter((item) => item.projectId === column.projectId))
+        },
+        addWorkspace: (input) => {
+          const workspaceId = uid()
+          set((state) => {
+            const workspace = {
+              id: workspaceId,
+              name: input.name,
+              icon: input.icon || input.name.slice(0, 1).toUpperCase(),
+              color: input.color || '#4cc9f0',
+              ownerId: state.profile.id,
+              members: [{ userId: state.profile.id, displayName: state.profile.displayName, role: 'owner' as const }],
+            }
+            return {
+              workspaces: [...state.workspaces, workspace],
+              filters: { ...state.filters, workspaceId, projectId: 'all', boardView: 'all' },
+            }
+          })
+          const created = get().workspaces.find((workspace) => workspace.id === workspaceId)
+          if (get().synced && created) sync.insertWorkspaceRemote(created, get().profile.id)
+        },
+        updateWorkspace: (id, patch) => {
+          set((state) => ({
+            workspaces: state.workspaces.map((workspace) => (workspace.id === id ? { ...workspace, ...patch } : workspace)),
+          }))
+          if (get().synced) sync.updateWorkspaceRemote(id, patch)
+        },
+        archiveWorkspace: (id) => {
+          // Workspace archiving is local-only (workspaces has no archived_at column);
+          // the contained projects are archived remotely so they stay hidden on reload.
+          const projectIdsToArchive = get().projects.filter((project) => project.workspaceId === id && !project.archived).map((project) => project.id)
+          set((state) => {
+            const projectIds = state.projects.filter((project) => project.workspaceId === id).map((project) => project.id)
+            const nextWorkspaceId = state.workspaces.find((workspace) => workspace.id !== id && !workspace.archived)?.id ?? 'all'
+            return {
+              workspaces: state.workspaces.map((workspace) => (workspace.id === id ? { ...workspace, archived: true } : workspace)),
+              projects: state.projects.map((project) => (project.workspaceId === id ? { ...project, archived: true } : project)),
+              filters: {
+                ...state.filters,
+                workspaceId: state.filters.workspaceId === id ? nextWorkspaceId : state.filters.workspaceId,
+                projectId: projectIds.includes(state.filters.projectId) ? 'all' : state.filters.projectId,
+                boardView: 'all',
+              },
+            }
+          })
+          if (get().synced) projectIdsToArchive.forEach((projectId) => sync.archiveProjectRemote(projectId))
+        },
+        addProject: (input) => {
+          const projectId = uid()
+          let createdColumns: BoardColumn[] = []
+          set((state) => {
+            const project: Project = {
+              id: projectId,
+              workspaceId: input.workspaceId,
+              name: input.name,
+              type: input.type,
+              color: input.color || (input.type === 'study_plan' ? '#27c98b' : '#4cc9f0'),
+            }
+            const columns: BoardColumn[] = defaultColumnNames(input.type).map((columnName, position) => ({
+              id: uid(),
+              projectId: project.id,
+              name: columnName,
+              position,
+              isCompleted: position === 2,
+            }))
+            createdColumns = columns
+            return {
+              projects: [...state.projects, project],
+              columns: [...state.columns, ...columns],
+              filters: { ...state.filters, workspaceId: input.workspaceId, projectId, boardView: 'all' },
+            }
+          })
+          const created = get().projects.find((project) => project.id === projectId)
+          if (get().synced && created) sync.insertProjectRemote(created, createdColumns)
+        },
+        updateProject: (id, patch) => {
+          set((state) => ({
+            projects: state.projects.map((project) => (project.id === id ? { ...project, ...patch } : project)),
+          }))
+          if (get().synced) sync.updateProjectRemote(id, patch)
+        },
+        archiveProject: (id) => {
+          set((state) => ({
+            projects: state.projects.map((project) => (project.id === id ? { ...project, archived: true } : project)),
+            filters: {
+              ...state.filters,
+              projectId: state.filters.projectId === id ? 'all' : state.filters.projectId,
+              boardView: state.filters.projectId === id ? 'all' : state.filters.boardView,
+            },
+          }))
+          if (get().synced) sync.archiveProjectRemote(id)
+        },
+        addWorkspaceMember: (workspaceId, input) =>
+          // Members beyond the owner are local-only (schema requires real auth users).
+          set((state) => {
+            const member: WorkspaceMember = {
+              userId: uid(),
+              displayName: input.displayName,
+              email: input.email,
+              role: input.role,
+              active: true,
+            }
+            return {
+              workspaces: state.workspaces.map((workspace) =>
+                workspace.id === workspaceId ? { ...workspace, members: [...workspace.members, member] } : workspace,
+              ),
+            }
+          }),
+        updateWorkspaceMember: (workspaceId, userId, patch) =>
+          set((state) => ({
+            workspaces: state.workspaces.map((workspace) =>
+              workspace.id === workspaceId
+                ? {
+                    ...workspace,
+                    members: workspace.members.map((member) => (member.userId === userId ? { ...member, ...patch } : member)),
+                  }
+                : workspace,
+            ),
+          })),
+        archiveWorkspaceMember: (workspaceId, userId) =>
+          set((state) => ({
+            workspaces: state.workspaces.map((workspace) =>
+              workspace.id === workspaceId
+                ? {
+                    ...workspace,
+                    members: workspace.members.map((member) => (member.userId === userId ? { ...member, active: false } : member)),
+                  }
+                : workspace,
+            ),
+            tasks: state.tasks.map((task) => (task.workspaceId === workspaceId && task.assigneeId === userId ? { ...task, assigneeId: null } : task)),
+          })),
+        addRoleCategory: (workspaceId, input) => {
+          const role: WorkspaceRoleCategory = { id: uid(), workspaceId, name: input.name, color: input.color || '#4cc9f0' }
+          set((state) => ({ roleCategories: [...state.roleCategories, role] }))
+          if (get().synced) sync.insertRoleCategoryRemote(role)
+        },
+        updateRoleCategory: (id, patch) => {
+          set((state) => ({
+            roleCategories: state.roleCategories.map((role) => (role.id === id ? { ...role, ...patch } : role)),
+          }))
+          if (get().synced) sync.updateRoleCategoryRemote(id, patch)
+        },
+        deleteRoleCategory: (id) => {
+          set((state) => ({
+            roleCategories: state.roleCategories.filter((role) => role.id !== id),
+            tasks: state.tasks.map((task) => (task.assigneeRoleId === id ? { ...task, assigneeRoleId: null } : task)),
+            filters: { ...state.filters, boardView: state.filters.boardView === `role:${id}` ? 'all' : state.filters.boardView },
+          }))
+          if (get().synced) sync.deleteRoleCategoryRemote(id)
+        },
+        addLearner: (workspaceId, name, grade, guardianName) => {
+          const learner: Learner = { id: uid(), workspaceId, name, grade: grade || undefined, guardianName: guardianName || undefined }
+          set((state) => ({ learners: [...state.learners, learner] }))
+          if (get().synced) sync.insertLearnerRemote(learner)
+        },
+        addSubject: (workspaceId, name, color = '#27c98b') => {
+          const subject: Subject = { id: uid(), workspaceId, name, color }
+          set((state) => ({ subjects: [...state.subjects, subject] }))
+          if (get().synced) sync.insertSubjectRemote(subject)
+        },
+        resetDemo: () => set({ ...demoData, filters: defaultFilters, synced: false }),
+      }
+    },
     {
       name: appConfig.storageKey,
       partialize: (state) => {
-        const { navOpen, ...persisted } = state
+        const { navOpen, synced, ...persisted } = state
         void navOpen
+        void synced
         return persisted
       },
       merge: (persisted, current) => {
@@ -461,6 +528,7 @@ export const usePlannerStore = create<PlannerState>()(
           roleCategories: saved.roleCategories ?? current.roleCategories,
           tasks: saved.tasks?.map((task) => ({ ...task, assigneeRoleId: task.assigneeRoleId ?? null })) ?? current.tasks,
           navOpen: false,
+          synced: false,
         }
       },
     },

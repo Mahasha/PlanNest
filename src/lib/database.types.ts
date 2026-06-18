@@ -23,6 +23,7 @@ export type Database = {
           avatar_url?: string | null
           updated_at?: string
         }
+        Relationships: []
       }
       workspaces: {
         Row: {
@@ -42,6 +43,7 @@ export type Database = {
           owner_id?: string
         }
         Update: Partial<Database['public']['Tables']['workspaces']['Insert']>
+        Relationships: []
       }
       workspace_members: {
         Row: {
@@ -58,6 +60,7 @@ export type Database = {
           role?: 'owner' | 'admin' | 'member' | 'viewer'
         }
         Update: Partial<Database['public']['Tables']['workspace_members']['Insert']>
+        Relationships: []
       }
       workspace_role_categories: {
         Row: {
@@ -74,6 +77,7 @@ export type Database = {
           color?: string
         }
         Update: Partial<Database['public']['Tables']['workspace_role_categories']['Insert']>
+        Relationships: []
       }
       projects: {
         Row: {
@@ -94,6 +98,7 @@ export type Database = {
           color?: string
         }
         Update: Partial<Database['public']['Tables']['projects']['Insert']> & { archived_at?: string | null }
+        Relationships: []
       }
       board_columns: {
         Row: {
@@ -113,6 +118,7 @@ export type Database = {
           is_completed?: boolean
         }
         Update: Partial<Database['public']['Tables']['board_columns']['Insert']> & { archived_at?: string | null }
+        Relationships: []
       }
       tasks: {
         Row: {
@@ -150,21 +156,25 @@ export type Database = {
           completed_at?: string | null
         }
         Update: Partial<Database['public']['Tables']['tasks']['Insert']>
+        Relationships: []
       }
       tags: {
         Row: { id: string; workspace_id: string; name: string; color: string; created_at: string }
         Insert: { id?: string; workspace_id: string; name: string; color?: string }
         Update: Partial<Database['public']['Tables']['tags']['Insert']>
+        Relationships: []
       }
       task_tags: {
         Row: { task_id: string; tag_id: string }
         Insert: { task_id: string; tag_id: string }
         Update: Partial<Database['public']['Tables']['task_tags']['Insert']>
+        Relationships: []
       }
       checklist_items: {
         Row: { id: string; task_id: string; title: string; completed: boolean; position: number; created_at: string }
         Insert: { id?: string; task_id: string; title: string; completed?: boolean; position?: number }
         Update: Partial<Database['public']['Tables']['checklist_items']['Insert']>
+        Relationships: []
       }
       learners: {
         Row: {
@@ -177,11 +187,13 @@ export type Database = {
         }
         Insert: { id?: string; workspace_id: string; name: string; guardian_name?: string | null; grade?: string | null }
         Update: Partial<Database['public']['Tables']['learners']['Insert']>
+        Relationships: []
       }
       subjects: {
         Row: { id: string; workspace_id: string; name: string; color: string; created_at: string }
         Insert: { id?: string; workspace_id: string; name: string; color?: string }
         Update: Partial<Database['public']['Tables']['subjects']['Insert']>
+        Relationships: []
       }
       study_task_details: {
         Row: {
@@ -207,6 +219,7 @@ export type Database = {
           guardian_notes?: string | null
         }
         Update: Partial<Database['public']['Tables']['study_task_details']['Insert']>
+        Relationships: []
       }
     }
     Views: Record<string, never>

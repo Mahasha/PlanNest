@@ -1,5 +1,5 @@
 import type { FormEvent, InputHTMLAttributes, ReactNode, TextareaHTMLAttributes } from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Navigate, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import {
   closestCorners,
@@ -43,6 +43,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { appConfig } from './config/app'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
 import { useSupabaseSession } from './lib/plannerQueries'
+import { ensureBootstrap, loadPlannerData } from './lib/plannerSync'
 import { usePlannerStore, useSelectedProject } from './store/plannerStore'
 import type { BoardColumn, Priority, Project, Task, Workspace, WorkspaceRoleCategory } from './types/domain'
 
@@ -99,7 +100,8 @@ function App() {
 
 function AuthPage() {
   const [mode, setMode] = useState<'login' | 'signup' | 'reset'>('login')
-  const [message, setMessage] = useState('')
+  const [message, setMessage] = useState<{ text: string; tone: 'info' | 'error' } | null>(null)
+  const [submitting, setSubmitting] = useState(false)
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const schema = z.object({
@@ -114,36 +116,44 @@ function AuthPage() {
   })
 
   const submit = form.handleSubmit(async (values) => {
-    setMessage('')
+    setMessage(null)
     if (!supabase) {
-      setMessage('Demo mode is active. Add Supabase env vars to enable email authentication.')
+      setMessage({ text: 'Demo mode is active. Add Supabase env vars to enable email authentication.', tone: 'info' })
       return
     }
-    if (mode === 'reset') {
-      const { error } = await supabase.auth.resetPasswordForEmail(values.email, {
-        redirectTo: window.location.origin,
-      })
-      if (error) throw error
-      setMessage('Password reset email sent.')
-      return
-    }
-    if (mode === 'signup') {
-      const { error } = await supabase.auth.signUp({
+    setSubmitting(true)
+    try {
+      if (mode === 'reset') {
+        const { error } = await supabase.auth.resetPasswordForEmail(values.email, {
+          redirectTo: window.location.origin,
+        })
+        if (error) throw error
+        setMessage({ text: 'Password reset email sent. Check your inbox.', tone: 'info' })
+        return
+      }
+      if (mode === 'signup') {
+        const { error } = await supabase.auth.signUp({
+          email: values.email,
+          password: values.password ?? '',
+          options: { data: { display_name: values.displayName } },
+        })
+        if (error) throw error
+        setMode('login')
+        setMessage({ text: 'Account created. Confirm your email if required, then log in.', tone: 'info' })
+        return
+      }
+      const { error } = await supabase.auth.signInWithPassword({
         email: values.email,
         password: values.password ?? '',
-        options: { data: { display_name: values.displayName } },
       })
       if (error) throw error
-      setMessage('Check your inbox to confirm your account.')
-      return
+      await queryClient.invalidateQueries({ queryKey: ['supabase-session'] })
+      navigate('/')
+    } catch (error) {
+      setMessage({ text: error instanceof Error ? error.message : 'Something went wrong. Please try again.', tone: 'error' })
+    } finally {
+      setSubmitting(false)
     }
-    const { error } = await supabase.auth.signInWithPassword({
-      email: values.email,
-      password: values.password ?? '',
-    })
-    if (error) throw error
-    await queryClient.invalidateQueries({ queryKey: ['supabase-session'] })
-    navigate('/')
   })
 
   return (
@@ -164,7 +174,10 @@ function AuthPage() {
               className={`rounded px-3 py-2 ${mode === item ? 'bg-white text-slate-950' : 'text-slate-300'}`}
               key={item}
               type="button"
-              onClick={() => setMode(item)}
+              onClick={() => {
+                setMode(item)
+                setMessage(null)
+              }}
             >
               {item === 'login' ? 'Login' : item === 'signup' ? 'Signup' : 'Reset'}
             </button>
@@ -187,12 +200,37 @@ function AuthPage() {
               <input className="mt-2 w-full rounded-md border border-white/10 bg-[#0d1016] px-3 py-2" type="password" {...form.register('password')} />
             </label>
           )}
-          {message && <p className="rounded-md border border-sky-400/30 bg-sky-400/10 p-3 text-sm text-sky-100">{message}</p>}
-          <button className="w-full rounded-md bg-[#27c98b] px-4 py-2 font-semibold text-[#061116]" type="submit">
-            {mode === 'reset' ? 'Send reset email' : mode === 'signup' ? 'Create account' : 'Login'}
+          {message && (
+            <p
+              className={`rounded-md border p-3 text-sm ${
+                message.tone === 'error'
+                  ? 'border-rose-400/30 bg-rose-400/10 text-rose-100'
+                  : 'border-sky-400/30 bg-sky-400/10 text-sky-100'
+              }`}
+            >
+              {message.text}
+            </p>
+          )}
+          <button
+            className="w-full rounded-md bg-[#27c98b] px-4 py-2 font-semibold text-[#061116] disabled:cursor-not-allowed disabled:opacity-60"
+            type="submit"
+            disabled={submitting}
+          >
+            {submitting ? 'Please wait…' : mode === 'reset' ? 'Send reset email' : mode === 'signup' ? 'Create account' : 'Login'}
           </button>
         </form>
       </section>
+    </main>
+  )
+}
+
+function FullScreenNote({ text }: { text: string }) {
+  return (
+    <main className="grid min-h-screen place-items-center px-5 py-8 text-sm text-slate-400">
+      <div className="flex items-center gap-3">
+        <span className="grid h-9 w-9 place-items-center rounded-md bg-[#4cc9f0] text-xs font-black text-[#061116]">{appConfig.initials}</span>
+        <span>{text}</span>
+      </div>
     </main>
   )
 }
@@ -201,13 +239,51 @@ function PlannerShell() {
   const navOpen = usePlannerStore((state) => state.navOpen)
   const setNavOpen = usePlannerStore((state) => state.setNavOpen)
   const resetDemo = usePlannerStore((state) => state.resetDemo)
-  const { data: session } = useSupabaseSession()
+  const hydrate = usePlannerStore((state) => state.hydrate)
+  const synced = usePlannerStore((state) => state.synced)
+  const { data: session, isLoading: sessionLoading } = useSupabaseSession()
   const navigate = useNavigate()
+  const [loadState, setLoadState] = useState<'idle' | 'ready' | 'error'>('idle')
+  const startedRef = useRef(false)
+
+  const userId = session?.user?.id
+  const email = session?.user?.email ?? ''
+  const displayName = (session?.user?.user_metadata?.display_name as string | undefined) || email.split('@')[0] || 'You'
+
+  const loadData = useCallback(async () => {
+    if (!userId) return
+    try {
+      await ensureBootstrap(userId, displayName)
+      hydrate(await loadPlannerData(userId, displayName, email))
+      setLoadState('ready')
+    } catch (error) {
+      console.error('[PlannerShell] failed to load planner data:', error)
+      setLoadState('error')
+    }
+  }, [userId, displayName, email, hydrate])
+
+  useEffect(() => {
+    if (isSupabaseConfigured && userId && !startedRef.current) {
+      startedRef.current = true
+      void loadData()
+    }
+  }, [loadData, userId])
 
   const logout = async () => {
     if (supabase) await supabase.auth.signOut()
     navigate('/auth')
   }
+
+  if (isSupabaseConfigured) {
+    if (sessionLoading) return <FullScreenNote text="Loading…" />
+    if (!session) return <Navigate to="/auth" replace />
+    if (loadState === 'error') return <FullScreenNote text="Could not load your data — refresh to retry." />
+    if (loadState !== 'ready' || !synced) return <FullScreenNote text="Loading your workspace…" />
+  }
+
+  const isSynced = isSupabaseConfigured && Boolean(session)
+  const resetLabel = isSynced ? 'Reload data' : 'Reset demo'
+  const onReset = isSynced ? () => void loadData() : resetDemo
 
   return (
     <div className="min-h-screen">
@@ -215,7 +291,7 @@ function PlannerShell() {
         <button className="mr-3 rounded-md border border-white/10 p-2" onClick={() => setNavOpen(true)} aria-label="Open navigation">
           <Menu size={18} />
         </button>
-        <UtilityMenu session={session} resetDemo={resetDemo} logout={logout} />
+        <UtilityMenu session={session} onReset={onReset} resetLabel={resetLabel} logout={logout} />
       </div>
       <div className="mx-auto flex min-h-screen w-full max-w-[1720px]">
         <aside
@@ -228,7 +304,7 @@ function PlannerShell() {
         <main className="min-w-0 flex-1">
           <div className="px-4 py-4 lg:px-6">
             <div className="mb-3 hidden justify-end lg:flex">
-              <UtilityMenu session={session} resetDemo={resetDemo} logout={logout} />
+              <UtilityMenu session={session} onReset={onReset} resetLabel={resetLabel} logout={logout} />
             </div>
             <Routes>
               <Route path="/" element={<Dashboard />} />
@@ -263,11 +339,13 @@ function Brand() {
 
 function UtilityMenu({
   session,
-  resetDemo,
+  onReset,
+  resetLabel,
   logout,
 }: {
   session: unknown
-  resetDemo: () => void
+  onReset: () => void
+  resetLabel: string
   logout: () => void
 }) {
   const [open, setOpen] = useState(false)
@@ -285,7 +363,7 @@ function UtilityMenu({
       </button>
       {open && (
         <div className="absolute right-0 top-11 z-20 w-44 rounded-md border border-white/10 bg-[#0d1016] p-1 shadow-xl">
-          <MenuButton onClick={resetDemo} icon={RotateCcw} label="Reset demo" />
+          <MenuButton onClick={onReset} icon={RotateCcw} label={resetLabel} />
           <MenuButton onClick={logout} icon={LogOut} label="Logout" />
         </div>
       )}
