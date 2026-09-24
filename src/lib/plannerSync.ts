@@ -1,4 +1,5 @@
 import { supabase } from './supabase'
+import { queueWrite } from './plannerOutbox'
 import type {
   BoardColumn,
   Learner,
@@ -16,8 +17,8 @@ import type {
 //
 // The Zustand store stays the synchronous source of truth for the UI; these
 // helpers (a) hydrate it from Supabase on login and (b) write changes back.
-// Writes are optimistic and fire-and-forget — failures are logged, not surfaced,
-// and reconcile on the next reload.
+// Writes are optimistic, recorded in a per-user outbox, and replayed in order.
+// A failed write remains pending and is surfaced by the planner shell.
 //
 // Known limitations (schema models members/assignees as REAL auth users):
 //  - Workspace members beyond the owner are not persisted (no invite flow yet).
@@ -32,9 +33,10 @@ import type {
 async function run(label: string, fn: () => PromiseLike<{ error: unknown }>): Promise<void> {
   try {
     const { error } = await fn()
-    if (error) console.error(`[plannerSync] ${label} failed:`, error)
+    if (error) throw error
   } catch (error) {
     console.error(`[plannerSync] ${label} threw:`, error)
+    throw error
   }
 }
 
@@ -115,6 +117,12 @@ export async function loadPlannerData(userId: string, fallbackName: string, emai
     db.from('subjects').select('*'),
     db.from('study_task_details').select('*'),
   ])
+
+  const requiredReads = { profiles, workspaces, members, roleCategories, projects, columns, tasks, tags, taskTags, checklist, learners, subjects, studyDetails }
+  const failedRead = Object.entries(requiredReads).find(([, result]) => result.error)
+  if (failedRead) {
+    throw new Error(`Could not load ${failedRead[0]}: ${failedRead[1].error?.message}`)
+  }
 
   const profilesById = new Map((profiles.data ?? []).map((row) => [row.id, row]))
   const me = profilesById.get(userId)
@@ -251,208 +259,119 @@ export async function loadPlannerData(userId: string, fallbackName: string, emai
 
 // ── Workspaces ───────────────────────────────────────────────────────────────
 export function insertWorkspaceRemote(ws: Workspace, userId: string) {
-  const db = supabase
-  if (!db) return
-  void run('workspace insert', () =>
-    db.from('workspaces').insert({ id: ws.id, name: ws.name, icon: ws.icon, color: ws.color, owner_id: userId }),
-  )
+  queueWrite({ kind: 'insert', table: 'workspaces', label: 'workspace insert', payload: {
+    id: ws.id, name: ws.name, icon: ws.icon, color: ws.color, owner_id: userId,
+  } })
 }
 
 export function updateWorkspaceRemote(id: string, patch: { name?: string; icon?: string; color?: string }) {
-  const db = supabase
-  if (!db) return
-  void run('workspace update', () => db.from('workspaces').update(patch).eq('id', id))
+  queueWrite({ kind: 'update', table: 'workspaces', rowId: id, label: 'workspace update', payload: patch })
 }
 
 // ── Projects ─────────────────────────────────────────────────────────────────
 export function insertProjectRemote(project: Project, columns: BoardColumn[]) {
-  const db = supabase
-  if (!db) return
-  void (async () => {
-    await run('project insert', () =>
-      db.from('projects').insert({
-        id: project.id,
-        workspace_id: project.workspaceId,
-        name: project.name,
-        type: project.type,
-        color: project.color,
-      }),
-    )
-    if (columns.length) {
-      await run('project columns insert', () =>
-        db.from('board_columns').insert(
-          columns.map((c) => ({ id: c.id, project_id: c.projectId, name: c.name, position: c.position, is_completed: c.isCompleted })),
-        ),
-      )
-    }
-  })()
+  queueWrite({ kind: 'insert', table: 'projects', label: 'project insert', payload: {
+    id: project.id, workspace_id: project.workspaceId, name: project.name, type: project.type, color: project.color,
+  } })
+  if (columns.length) queueWrite({ kind: 'insert', table: 'board_columns', label: 'project columns insert', payload:
+    columns.map((c) => ({ id: c.id, project_id: c.projectId, name: c.name, position: c.position, is_completed: c.isCompleted })),
+  })
 }
 
 export function updateProjectRemote(id: string, patch: { name?: string; color?: string }) {
-  const db = supabase
-  if (!db) return
-  void run('project update', () => db.from('projects').update(patch).eq('id', id))
+  queueWrite({ kind: 'update', table: 'projects', rowId: id, label: 'project update', payload: patch })
 }
 
 export function archiveProjectRemote(id: string) {
-  const db = supabase
-  if (!db) return
-  void run('project archive', () => db.from('projects').update({ archived_at: new Date().toISOString() }).eq('id', id))
+  queueWrite({ kind: 'update', table: 'projects', rowId: id, label: 'project archive', payload: { archived_at: new Date().toISOString() } })
 }
 
-// ── Board columns ──────────────────────────────────────────────────────────────
+// ── Board columns ────────────────────────────────────────────────────────────
 export function insertColumnRemote(column: BoardColumn) {
-  const db = supabase
-  if (!db) return
-  void run('column insert', () =>
-    db.from('board_columns').insert({
-      id: column.id,
-      project_id: column.projectId,
-      name: column.name,
-      position: column.position,
-      is_completed: column.isCompleted,
-    }),
-  )
+  queueWrite({ kind: 'insert', table: 'board_columns', label: 'column insert', payload: {
+    id: column.id, project_id: column.projectId, name: column.name, position: column.position, is_completed: column.isCompleted,
+  } })
 }
 
 export function updateColumnRemote(id: string, patch: { name?: string; position?: number; is_completed?: boolean }) {
-  const db = supabase
-  if (!db) return
-  void run('column update', () => db.from('board_columns').update(patch).eq('id', id))
+  queueWrite({ kind: 'update', table: 'board_columns', rowId: id, label: 'column update', payload: patch })
 }
 
 export function archiveColumnRemote(id: string) {
-  const db = supabase
-  if (!db) return
-  void run('column archive', () => db.from('board_columns').update({ archived_at: new Date().toISOString(), is_completed: false }).eq('id', id))
+  queueWrite({ kind: 'update', table: 'board_columns', rowId: id, label: 'column archive', payload: {
+    archived_at: new Date().toISOString(), is_completed: false,
+  } })
 }
 
 export function syncColumnsRemote(columns: BoardColumn[]) {
-  const db = supabase
-  if (!db) return
   for (const column of columns) {
-    void run('column position sync', () =>
-      db.from('board_columns').update({ position: column.position, is_completed: column.isCompleted }).eq('id', column.id),
-    )
+    queueWrite({ kind: 'update', table: 'board_columns', rowId: column.id, label: 'column position sync', payload: {
+      position: column.position, is_completed: column.isCompleted,
+    } })
   }
 }
 
 // ── Tasks ────────────────────────────────────────────────────────────────────
-export async function upsertTaskRemote(task: Task, userId: string): Promise<void> {
-  const db = supabase
-  if (!db) return
-  // Person-assignment only persists for the current user (schema FK → profiles).
+export function upsertTaskRemote(task: Task, userId: string) {
   const assigneeId = task.assigneeId === userId ? userId : null
-
-  await run('task upsert', () =>
-    db.from('tasks').upsert(
-      {
-        id: task.id,
-        workspace_id: task.workspaceId,
-        project_id: task.projectId,
-        column_id: task.columnId,
-        title: task.title,
-        description: task.description ?? null,
-        priority: task.priority,
-        due_date: task.dueDate ?? null,
-        start_date: task.startDate ?? null,
-        assignee_id: assigneeId,
-        assignee_role_id: task.assigneeRoleId ?? null,
-        position: task.position,
-        created_by: userId,
-        completed_at: task.completedAt ?? null,
-      },
-      { onConflict: 'id' },
-    ),
-  )
-
-  await run('task_tags clear', () => db.from('task_tags').delete().eq('task_id', task.id))
-  if (task.tags.length) {
-    await run('task_tags insert', () => db.from('task_tags').insert(task.tags.map((tagId) => ({ task_id: task.id, tag_id: tagId }))))
-  }
-
-  await run('checklist clear', () => db.from('checklist_items').delete().eq('task_id', task.id))
-  if (task.checklist.length) {
-    await run('checklist insert', () =>
-      db.from('checklist_items').insert(
-        task.checklist.map((item, index) => ({ id: crypto.randomUUID(), task_id: task.id, title: item.title, completed: item.completed, position: item.position ?? index })),
-      ),
-    )
-  }
-
-  if (task.study) {
-    await run('study details upsert', () =>
-      db.from('study_task_details').upsert(
-        {
-          task_id: task.id,
-          learner_id: task.study!.learnerId,
-          subject_id: task.study!.subjectId,
-          topic: task.study!.topic,
-          exercise_type: task.study!.exerciseType,
-          estimated_minutes: task.study!.estimatedMinutes,
-          result_mark: task.study!.resultMark ?? null,
-          correction_required: task.study!.correctionRequired,
-          guardian_notes: task.study!.guardianNotes ?? null,
-        },
-        { onConflict: 'task_id' },
-      ),
-    )
-  } else {
-    await run('study details clear', () => db.from('study_task_details').delete().eq('task_id', task.id))
-  }
+  queueWrite({ kind: 'task-save', label: 'task save', payload: {
+    p_task: {
+      id: task.id, workspace_id: task.workspaceId, project_id: task.projectId, column_id: task.columnId,
+      title: task.title, description: task.description ?? null, priority: task.priority,
+      due_date: task.dueDate ?? null, start_date: task.startDate ?? null,
+      assignee_id: assigneeId, assignee_role_id: task.assigneeRoleId ?? null,
+      position: task.position, completed_at: task.completedAt ?? null,
+    },
+    p_tags: task.tags,
+    p_checklist: task.checklist.map((item, index) => ({
+      id: item.id, title: item.title, completed: item.completed, position: item.position ?? index,
+    })),
+    p_study: task.study ? {
+      learner_id: task.study.learnerId, subject_id: task.study.subjectId,
+      topic: task.study.topic, exercise_type: task.study.exerciseType,
+      estimated_minutes: task.study.estimatedMinutes, result_mark: task.study.resultMark ?? null,
+      correction_required: task.study.correctionRequired, guardian_notes: task.study.guardianNotes ?? null,
+    } : null,
+  } })
 }
 
 export function deleteTaskRemote(id: string) {
-  const db = supabase
-  if (!db) return
-  void run('task delete', () => db.from('tasks').delete().eq('id', id))
+  queueWrite({ kind: 'delete', table: 'tasks', rowId: id, label: 'task delete' })
 }
 
-/** Push column/position/completed changes for a batch of tasks (after moves/reorders). */
 export function syncTasksRemote(tasks: Task[]) {
-  const db = supabase
-  if (!db) return
   for (const task of tasks) {
-    void run('task position sync', () =>
-      db.from('tasks').update({ column_id: task.columnId, position: task.position, completed_at: task.completedAt ?? null }).eq('id', task.id),
-    )
+    queueWrite({ kind: 'update', table: 'tasks', rowId: task.id, label: 'task position sync', payload: {
+      column_id: task.columnId, position: task.position, completed_at: task.completedAt ?? null,
+    } })
   }
 }
 
-// ── Role categories ────────────────────────────────────────────────────────────
+// ── Role categories ──────────────────────────────────────────────────────────
 export function insertRoleCategoryRemote(role: WorkspaceRoleCategory) {
-  const db = supabase
-  if (!db) return
-  void run('role category insert', () =>
-    db.from('workspace_role_categories').insert({ id: role.id, workspace_id: role.workspaceId, name: role.name, color: role.color }),
-  )
+  queueWrite({ kind: 'insert', table: 'workspace_role_categories', label: 'role category insert', payload: {
+    id: role.id, workspace_id: role.workspaceId, name: role.name, color: role.color,
+  } })
 }
 
 export function updateRoleCategoryRemote(id: string, patch: { name?: string; color?: string }) {
-  const db = supabase
-  if (!db) return
-  void run('role category update', () => db.from('workspace_role_categories').update(patch).eq('id', id))
+  queueWrite({ kind: 'update', table: 'workspace_role_categories', rowId: id, label: 'role category update', payload: patch })
 }
 
 export function deleteRoleCategoryRemote(id: string) {
-  const db = supabase
-  if (!db) return
-  void run('role category delete', () => db.from('workspace_role_categories').delete().eq('id', id))
+  queueWrite({ kind: 'delete', table: 'workspace_role_categories', rowId: id, label: 'role category delete' })
 }
 
 // ── Learners & subjects ──────────────────────────────────────────────────────
 export function insertLearnerRemote(learner: Learner) {
-  const db = supabase
-  if (!db) return
-  void run('learner insert', () =>
-    db.from('learners').insert({ id: learner.id, workspace_id: learner.workspaceId, name: learner.name, grade: learner.grade ?? null, guardian_name: learner.guardianName ?? null }),
-  )
+  queueWrite({ kind: 'insert', table: 'learners', label: 'learner insert', payload: {
+    id: learner.id, workspace_id: learner.workspaceId, name: learner.name,
+    grade: learner.grade ?? null, guardian_name: learner.guardianName ?? null,
+  } })
 }
 
 export function insertSubjectRemote(subject: Subject) {
-  const db = supabase
-  if (!db) return
-  void run('subject insert', () =>
-    db.from('subjects').insert({ id: subject.id, workspace_id: subject.workspaceId, name: subject.name, color: subject.color }),
-  )
+  queueWrite({ kind: 'insert', table: 'subjects', label: 'subject insert', payload: {
+    id: subject.id, workspace_id: subject.workspaceId, name: subject.name, color: subject.color,
+  } })
 }

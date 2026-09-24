@@ -223,7 +223,17 @@ export type Database = {
       }
     }
     Views: Record<string, never>
-    Functions: Record<string, never>
+    Functions: {
+      save_task: {
+        Args: {
+          p_task: Json
+          p_tags: Json
+          p_checklist: Json
+          p_study: Json
+        }
+        Returns: undefined
+      }
+    }
     Enums: {
       workspace_role: 'owner' | 'admin' | 'member' | 'viewer'
       project_type: 'general' | 'study_plan'
