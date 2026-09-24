@@ -44,6 +44,7 @@ import { appConfig } from './config/app'
 import { isSupabaseConfigured, supabase } from './lib/supabase'
 import { useSupabaseSession } from './lib/plannerQueries'
 import { ensureBootstrap, loadPlannerData } from './lib/plannerSync'
+import { flushPendingWrites, pendingWriteCount, setActiveSyncUser } from './lib/plannerOutbox'
 import { usePlannerStore, useSelectedProject } from './store/plannerStore'
 import type { BoardColumn, Priority, Project, Task, Workspace, WorkspaceRoleCategory } from './types/domain'
 
@@ -93,8 +94,51 @@ function App() {
   return (
     <Routes>
       <Route path="/auth" element={<AuthPage />} />
+      <Route path="/update-password" element={<UpdatePasswordPage />} />
       <Route path="/*" element={<PlannerShell />} />
     </Routes>
+  )
+}
+
+function UpdatePasswordPage() {
+  const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [message, setMessage] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const navigate = useNavigate()
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (password.length < 6 || password !== confirm) {
+      setMessage('Enter matching passwords of at least 6 characters.')
+      return
+    }
+    if (!supabase) return
+    setSubmitting(true)
+    const { error } = await supabase.auth.updateUser({ password })
+    setSubmitting(false)
+    if (error) {
+      setMessage(error.message)
+      return
+    }
+    navigate('/', { replace: true })
+  }
+
+  return (
+    <main className="grid min-h-screen place-items-center px-5 py-8">
+      <form className="w-full max-w-md space-y-4 rounded-lg border border-white/10 bg-[#111821] p-6" onSubmit={submit}>
+        <h1 className="text-2xl font-semibold">Set a new password</h1>
+        <p className="text-sm text-slate-400">Use the link in your reset email to open this page.</p>
+        <label className="block text-sm">New password
+          <input className="mt-2 w-full rounded border border-white/10 bg-[#0d1016] px-3 py-2" type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} required />
+        </label>
+        <label className="block text-sm">Confirm password
+          <input className="mt-2 w-full rounded border border-white/10 bg-[#0d1016] px-3 py-2" type="password" autoComplete="new-password" value={confirm} onChange={(event) => setConfirm(event.target.value)} required />
+        </label>
+        {message && <p role="alert" className="text-sm text-rose-200">{message}</p>}
+        <button className="rounded bg-[#4cc9f0] px-4 py-2 font-semibold text-[#061116] disabled:opacity-50" disabled={submitting} type="submit">Update password</button>
+      </form>
+    </main>
   )
 }
 
@@ -125,7 +169,7 @@ function AuthPage() {
     try {
       if (mode === 'reset') {
         const { error } = await supabase.auth.resetPasswordForEmail(values.email, {
-          redirectTo: window.location.origin,
+          redirectTo: `${window.location.origin}/update-password`,
         })
         if (error) throw error
         setMessage({ text: 'Password reset email sent. Check your inbox.', tone: 'info' })
@@ -244,6 +288,8 @@ function PlannerShell() {
   const { data: session, isLoading: sessionLoading } = useSupabaseSession()
   const navigate = useNavigate()
   const [loadState, setLoadState] = useState<'idle' | 'ready' | 'error'>('idle')
+  const [loadError, setLoadError] = useState('')
+  const [pendingWrites, setPendingWrites] = useState(0)
   const startedRef = useRef(false)
 
   const userId = session?.user?.id
@@ -253,11 +299,16 @@ function PlannerShell() {
   const loadData = useCallback(async () => {
     if (!userId) return
     try {
+      setActiveSyncUser(userId)
       await ensureBootstrap(userId, displayName)
+      await flushPendingWrites()
       hydrate(await loadPlannerData(userId, displayName, email))
       setLoadState('ready')
+      setLoadError('')
+      setPendingWrites(pendingWriteCount())
     } catch (error) {
       console.error('[PlannerShell] failed to load planner data:', error)
+      setLoadError(error instanceof Error ? error.message : 'Could not load your workspace.')
       setLoadState('error')
     }
   }, [userId, displayName, email, hydrate])
@@ -269,7 +320,14 @@ function PlannerShell() {
     }
   }, [loadData, userId])
 
+  useEffect(() => {
+    const refresh = () => setPendingWrites(pendingWriteCount())
+    window.addEventListener('plannest:sync-status', refresh)
+    return () => window.removeEventListener('plannest:sync-status', refresh)
+  }, [])
+
   const logout = async () => {
+    setActiveSyncUser(null)
     if (supabase) await supabase.auth.signOut()
     navigate('/auth')
   }
@@ -277,7 +335,14 @@ function PlannerShell() {
   if (isSupabaseConfigured) {
     if (sessionLoading) return <FullScreenNote text="Loading…" />
     if (!session) return <Navigate to="/auth" replace />
-    if (loadState === 'error') return <FullScreenNote text="Could not load your data — refresh to retry." />
+    if (loadState === 'error') return (
+      <main className="grid min-h-screen place-items-center p-6 text-center">
+        <div className="max-w-md space-y-4">
+          <p role="alert">{loadError} Your local changes are preserved.</p>
+          <button className="rounded bg-[#4cc9f0] px-4 py-2 font-semibold text-[#061116]" onClick={() => void loadData()}>Retry sync</button>
+        </div>
+      </main>
+    )
     if (loadState !== 'ready' || !synced) return <FullScreenNote text="Loading your workspace…" />
   }
 
@@ -306,6 +371,12 @@ function PlannerShell() {
             <div className="mb-3 hidden justify-end lg:flex">
               <UtilityMenu session={session} onReset={onReset} resetLabel={resetLabel} logout={logout} />
             </div>
+            {isSynced && pendingWrites > 0 && (
+              <div role="status" className="mb-4 rounded border border-amber-400/30 bg-amber-400/10 p-3 text-sm text-amber-100">
+                {pendingWrites} change{pendingWrites === 1 ? '' : 's'} waiting to sync.
+                <button className="ml-3 underline" onClick={() => void flushPendingWrites().catch(() => setPendingWrites(pendingWriteCount()))}>Retry now</button>
+              </div>
+            )}
             <Routes>
               <Route path="/" element={<Dashboard />} />
               <Route path="/board" element={<KanbanBoard />} />
